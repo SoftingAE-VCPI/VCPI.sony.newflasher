@@ -4754,6 +4754,13 @@ skip_this:
 
 	printf("\n");
 	printf("Processing boot delivery...\n\n");
+	char bootzip[256];
+#ifdef _WIN32
+	snprintf(bootzip, sizeof(bootzip), "%s\\boot.zip", working_path);
+#else
+	snprintf(bootzip, sizeof(bootzip), "./boot.zip");
+#endif
+
 #ifdef _WIN32
 	snprintf(sinfil, sizeof(sinfil), "%s\\boot\\boot_delivery.xml", working_path);
 #else
@@ -4761,11 +4768,17 @@ skip_this:
 #endif
 	if (stat(sinfil, &filestat) < 0)
 	{
-		printf("boot_delivery.xml not exist in boot folder or no boot folder.\n");
-		ret = 1;
-		goto getoutofflashing;
+		if (stat(bootzip, &filestat) == 0)
+		{
+			printf("Found boot.zip, extracting ... \n");
+			system("unzip boot.zip -d boot");
+		} else {
+			printf("boot/boot_delivery.xml or boot.zip does not exist ...\n");
+			ret = 1;
+			goto getoutofflashing;
+		}
 	}
-	else
+	if (stat(sinfil, &filestat) == 0)
 		printf("Found boot_delivery.xml in boot folder.\n");
 
 	if (!parse_xml(sinfil))
@@ -4893,6 +4906,29 @@ skip_this:
 								}
 								else
 								{
+									fseeko64(a, 0, SEEK_SET);
+									memcpy(remember_current_slot, current_slot, 1);
+
+									if (memcmp(current_slot, "a", 1) == 0)
+									{
+										memcpy(current_slot, "b", 1);
+									}
+									else
+									{
+										if (memcmp(current_slot, "b", 1) == 0)
+											memcpy(current_slot, "a", 1);
+									}
+									printf(" - Open to open %s!\n", sinfil);
+									if (!process_sins(dev, a, sinfil, working_path, "boot", "flash"))
+									{
+										fclose(a);
+										remove(fld);
+										ret = 1;
+										goto getoutofflashing;
+									}
+
+									memcpy(current_slot, remember_current_slot, 1);
+									fseeko64(a, 0, SEEK_SET);
 									if (!process_sins(dev, a, sinfil, working_path, "boot", "flash"))
 									{
 										fclose(a);
@@ -4916,6 +4952,31 @@ skip_this:
 								}
 								else
 								{
+									fseeko64(a, 0, SEEK_SET);
+									memcpy(remember_current_slot, current_slot, 1);
+
+									if (memcmp(current_slot, "a", 1) == 0)
+									{
+										memcpy(current_slot, "b", 1);
+									}
+									else
+									{
+										if (memcmp(current_slot, "b", 1) == 0)
+											memcpy(current_slot, "a", 1);
+									}
+
+									if (!process_sins(dev, a, sinfil, working_path, "boot", "flash"))
+									{
+										fclose(a);
+										remove(fld);
+										closedir(dir);
+										ret = 1;
+										goto getoutofflashing;
+									}
+
+									memcpy(current_slot, remember_current_slot, 1);
+									fseeko64(a, 0, SEEK_SET);
+
 									if (!process_sins(dev, a, sinfil, working_path, "boot", "flash"))
 									{
 										fclose(a);
