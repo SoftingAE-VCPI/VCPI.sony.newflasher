@@ -48,12 +48,14 @@
 #include <windows.h>
 #include <setupapi.h>
 #include <initguid.h>
-
+#if 0
 #include "GordonGate.h"
+#endif
 #endif
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -196,7 +198,7 @@ static unsigned int keystore_counter = 0;
 static char security_state[128];
 static char s1_root[64];
 static char sake_root[16];
-static char get_root_key_hash[0x41];
+static char get_root_key_hash[0x61];
 static char slot_count[2];
 static char current_slot[2];
 static char remember_current_slot[2];
@@ -2712,10 +2714,217 @@ static unsigned long get_free_space(char *fnPath)
 }
 #endif
 
+#pragma pack(push, 1)
+struct ZipLocalFileHeader {
+    uint32_t signature;
+    uint16_t version;
+    uint16_t flags;
+    uint16_t compression;
+    uint16_t modTime;
+    uint16_t modDate;
+    uint32_t crc32;
+    uint32_t compressedSize;
+    uint32_t uncompressedSize;
+    uint16_t fileNameLength;
+    uint16_t extraFieldLength;
+};
+#pragma pack(pop)
+
+#define ZIP_LOCAL_FILE_HEADER_SIG 0x04034b50
+
+void create_directories(const char *path) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = 0;
+#ifdef unix
+            mkdir(tmp, 0755);  // POSIX. Use `_mkdir` on Windows
+#elif defined(_WIN32)
+			_mkdir(tmp);
+#endif
+            *p = '/';
+        }
+    }
+}
+
+int unzip_file(const char *zip_path, const char *out_dir) {
+    FILE *f = fopen(zip_path, "rb");
+    if (!f) {
+        perror("fopen");
+        return 1;
+    }
+
+    // --- Step 1: Ensure base extraction dir exists ---
+#ifdef unix
+    mkdir(out_dir, 0755);
+#elif defined(_WIN32)
+    _mkdir(out_dir);
+#endif
+
+    // --- Step 2: Extract files into out_dir ---
+    while (1) {
+        struct ZipLocalFileHeader header;
+        if (fread(&header, sizeof(header), 1, f) != 1) break;
+        if (header.signature != ZIP_LOCAL_FILE_HEADER_SIG) break;
+
+        char filename[256] = {0};
+        if (header.fileNameLength >= sizeof(filename)) {
+            fprintf(stderr, "Filename too long.\n");
+            return 1;
+        }
+
+        fread(filename, 1, header.fileNameLength, f);
+        fseek(f, header.extraFieldLength, SEEK_CUR);
+
+        // Build final path = out_dir + "/" + filename
+        char fullpath[768];
+#ifdef _WIN32
+        snprintf(fullpath, sizeof(fullpath), "%s\\%s", out_dir, filename);
+#else
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", out_dir, filename);
+#endif
+
+        printf("Extracting: %s\n", fullpath);
+
+        // --- Directories ---
+        if (filename[strlen(filename) - 1] == '/' || filename[strlen(filename) - 1] == '\\') {
+#ifdef unix
+            mkdir(fullpath, 0755);
+#elif defined(_WIN32)
+            _mkdir(fullpath);
+#endif
+            continue;
+        }
+
+        create_directories(fullpath);  // Ensure parent dirs exist
+
+        FILE *out = fopen(fullpath, "wb");
+        if (!out) {
+            perror("fopen output");
+            fseek(f, header.compressedSize, SEEK_CUR);
+            continue;
+        }
+
+        // --- Extract file data ---
+        if (header.compression == 0) {
+            for (uint32_t i = 0; i < header.uncompressedSize; ++i) {
+                int c = fgetc(f);
+                if (c == EOF) break;
+                fputc(c, out);
+            }
+        } else if (header.compression == 8) {
+            uint8_t *comp = malloc(header.compressedSize);
+            uint8_t *decomp = malloc(header.uncompressedSize);
+            fread(comp, 1, header.compressedSize, f);
+
+            z_stream strm = {0};
+            strm.next_in = comp;
+            strm.avail_in = header.compressedSize;
+            strm.next_out = decomp;
+            strm.avail_out = header.uncompressedSize;
+
+            if (inflateInit2(&strm, -MAX_WBITS) != Z_OK) {
+                fprintf(stderr, "inflateInit failed\n");
+            } else if (inflate(&strm, Z_FINISH) != Z_STREAM_END) {
+                fprintf(stderr, "inflate failed\n");
+            } else {
+                fwrite(decomp, 1, strm.total_out, out);
+            }
+
+            inflateEnd(&strm);
+            free(comp);
+            free(decomp);
+        } else {
+            fprintf(stderr, "Unsupported compression method: %d\n", header.compression);
+            fseek(f, header.compressedSize, SEEK_CUR);
+        }
+
+        fclose(out);
+    }
+
+    fclose(f);
+    return 0;
+}
+
+int create_delivery_xml() {
+    const char *folder = "partition";
+    char xml_path[512];
+#ifdef _WIN32
+    snprintf(xml_path, sizeof(xml_path), "%s\\partition_delivery.xml", folder);
+#else
+    snprintf(xml_path, sizeof(xml_path), "%s/partition_delivery.xml", folder);
+#endif
+    FILE *xml = fopen(xml_path, "w");
+    if (!xml) {
+        perror("fopen");
+        return 1;
+    }
+
+    fprintf(xml, "<PARTITION_DELIVERY FORMAT=\"1\">\n");
+    fprintf(xml, "  <PARTITION_IMAGES>\n");
+
+#ifdef _WIN32
+    WIN32_FIND_DATA fdFile;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\*.sin", folder);
+    HANDLE hFind = FindFirstFile(path, &fdFile);
+
+    if(hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if(!(fdFile.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                fprintf(xml, "    <FILE PATH=\"%s\"/>\n", fdFile.cFileName);
+            }
+        } while(FindNextFile(hFind, &fdFile));
+        FindClose(hFind);
+    }
+#else
+    DIR *d = opendir(folder);
+    if (!d) { perror("opendir"); return 1; }
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        if (entry->d_type == DT_REG) { // regular file
+            const char *name = entry->d_name;
+            size_t len = strlen(name);
+            if (len > 4 && strcmp(name + len - 4, ".sin") == 0) {
+                fprintf(xml, "    <FILE PATH=\"%s\"/>\n", name);
+            }
+        }
+    }
+    closedir(d);
+#endif
+
+    fprintf(xml, "  </PARTITION_IMAGES>\n");
+    fprintf(xml, "</PARTITION_DELIVERY>\n");
+    fclose(xml);
+
+    printf("XML generated: partition_delivery.xml\n");
+    return 0;
+}
+
+void showHelp(char *progname)
+{
+    printf("Usage: %s [options]\n", progname);
+    printf("Options:\n");
+	printf("  -r, --reboot      Set Reboot mode, Must be one of:\n");
+	printf("		c|C - Reboot to Flash mode (default)\n");
+	printf("		r|R - Reboot to Recovery mode\n");
+	printf("		a|A - Reboot to Android mode\n");
+	printf("		f|F - Reboot to Fastboot mode\n");
+	printf("		b|B - Reboot to Bootloader mode\n");
+	printf("		p|P - Poweroff\n");
+	printf("  -h                Show this help message\n");
+	printf("  -R, --reboot-only Reboot only, do not flash anything\n");
+	printf("\nIf no options are provided, the program will flash the device and reboot to Flash mode by default.\n");
+}
+
 /*========================================================================================*/
 
 int main(int argc, char *argv[])
 {
+    // Disable buffering on stdout
+    setvbuf(stdout, NULL, _IONBF, 0);
+
 	FILE *fi = NULL;
 	int fld_cbck;
 	char fld[256];
@@ -2742,7 +2951,8 @@ int main(int argc, char *argv[])
 
 	unsigned long available_mb;
 
-	unsigned char reboot_mode = 0;
+	unsigned char reboot_mode = 2; // Flash
+	bool reboot_only = false;
 	char reboot_string[32];
 
 	bool flash_session_created = false;
@@ -2764,6 +2974,76 @@ int main(int argc, char *argv[])
 	printf("            %s v%d by Munjeni @ 2017/2023           \n", progname, VERSION);
 	printf("--------------------------------------------------------\n");
 
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0) {
+            showHelp(progname);
+            return 0;
+
+        } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--reboot") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: -r requires a mode argument!\n");
+                showHelp(progname);
+                return 1;
+            }
+            i++; // consume next arg as mode
+            char *mode = argv[i];
+
+			if (strcmp(mode, "p") == 0 || strcmp(mode, "P") == 0)
+				reboot_mode = 0;
+			else if (strcmp(mode, "a") == 0 || strcmp(mode, "A") == 0)
+                reboot_mode = 1;
+            else if (strcmp(mode, "c") == 0 || strcmp(mode, "C") == 0)
+                reboot_mode = 2;
+            else if (strcmp(mode, "b") == 0 || strcmp(mode, "B") == 0)
+                reboot_mode = 3;
+            else if (strcmp(mode, "f") == 0 || strcmp(mode, "F") == 0)
+                reboot_mode = 4;
+			else if (strcmp(mode, "r") == 0 || strcmp(mode, "R") == 0)
+				reboot_mode = 5;
+            else {
+                fprintf(stderr, "Error! Invalid reboot mode '%s'!\n", mode);
+                showHelp(progname);
+                return 1;
+            }
+
+        } else if (strcmp(argv[i], "-R") == 0 || strcmp(argv[i], "--reboot-only") == 0) {
+            reboot_only = true;
+
+        } else {
+            fprintf(stderr, "Error! Unknown option '%s'\n", argv[i]);
+            showHelp(progname);
+            return 1;
+        }
+    }
+
+	if (reboot_mode)
+	{
+		printf("Reboot mode set to: ");
+		switch (reboot_mode) {
+			case 1:
+				printf("Android");
+				break;
+			case 2:
+				printf("Flash");
+				break;
+			case 3:
+				printf("Bootloader");
+				break;
+			case 4:
+				printf("Fastboot");
+				break;
+			case 5:
+				printf("Recovery");
+				break;
+			case 0:
+				printf("Poweroff");
+				break;
+			default:
+				printf("Poweroff");
+		}
+		printf("\n");
+	}
+
 	available_mb = get_free_space(working_path);
 
 	if (available_mb < 10240)
@@ -2778,6 +3058,7 @@ int main(int argc, char *argv[])
 	memset(current_slot, 0x30, sizeof(current_slot));
 
 /*========================================  extract GordonGate  ======================================*/
+#if 0
 #ifdef _WIN32
 	if (argc < 2)
 	{
@@ -2798,6 +3079,7 @@ int main(int argc, char *argv[])
 			goto pauza;
 		}
 	}
+#endif
 #endif
 /*====================================================================================================*/
 
@@ -3019,6 +3301,12 @@ int main(int argc, char *argv[])
 #endif
 #endif
 
+	if (reboot_only)
+	{
+		printf("\nRebooting device only...\n");
+		goto endflashing;
+	}
+
 /*========================================  keep userdata?  ======================================*/
 
 	/* search for update.xml */
@@ -3032,6 +3320,7 @@ int main(int argc, char *argv[])
 	{
 		printf("\nupdate.xml not exist in current folder!\n");
 	}
+#if 0
 	else
 	{
 		printf("\nDo you want to keep userdata? Type 'y' and press ENTER to confirm, or type 'n' to erase userdata.\n");
@@ -3041,9 +3330,9 @@ int main(int argc, char *argv[])
 			keep_userdata = true;
 		}
 	}
-
+#endif
 /*============================================  reboot mode ==========================================*/
-
+#if 0
 	if (argc < 2)
 	{
 		printf("\nReboot mode at the end of flashing:\n  type 'a' for reboot to android, type 'f' for reboot to fastboot, type 's' for reboot to same mode, type 'p' for poweroff, and press ENTER.\n");
@@ -3072,9 +3361,9 @@ int main(int argc, char *argv[])
 				break;
 		}
 	}
-
+#endif
 /*======================================= commands from script =======================================*/
-
+#if 0
 	if (argc > 1)
 	{
 		if (transfer_bulk_async(dev, EP_OUT, argv[1], strlen(argv[1]), USB_TIMEOUT, 1) < 1)
@@ -3206,9 +3495,9 @@ int main(int argc, char *argv[])
 
 		goto endflashing;
 	}
-
+#endif
 /*==========================================  dump trim area  ========================================*/
-
+#if 0
 	printf("\nOptional step! Type 'y' and press ENTER if you want dump trim area, or type 'n' and press ENTER to skip.\n");
 	printf("Do in mind this doesn't dump drm key since sake authentifiction is need for that! But it is recommend to have dump in case hard brick!\n");
 	if (scanf(" %c", &ch)) { }
@@ -3445,7 +3734,7 @@ int main(int argc, char *argv[])
 		memset(tmp_reply, 0, BUFF_MAX);
 		goto endflashing;
 	}
-
+#endif
 /*=========================================  DEVICE INFO  ============================================*/
 
 	snprintf(tmp, sizeof(tmp), "getvar:max-download-size");
@@ -4038,17 +4327,44 @@ int main(int argc, char *argv[])
 #else
 	snprintf(tmp, sizeof(tmp), "./partition");
 #endif
+	char partitionzip[256];
+#ifdef _WIN32
+	snprintf(partitionzip, sizeof(partitionzip), "%s\\partition.zip", working_path);
+#else
+	snprintf(partitionzip, sizeof(partitionzip), "./partition.zip");
+#endif
+
+#ifdef _WIN32
+		snprintf(sinfil, sizeof(sinfil), "%s\\partition\\partition_delivery.xml", working_path);
+#else
+		snprintf(sinfil, sizeof(sinfil), "./partition/partition_delivery.xml");
+#endif
+
+	if (stat(sinfil, &filestat) < 0)
+	{
+		if (stat(partitionzip, &filestat) == 0)
+		{
+			printf("Found partition.zip, extracting ... \n");
+			if (unzip_file(partitionzip, "partition") != 0) {
+				printf("Failed to extract partition.zip!\n");
+				ret = 1;
+				goto getoutofflashing;
+			}
+			if (stat(sinfil, &filestat) < 0) {
+				create_delivery_xml();
+			}
+		} else {
+			printf("partition/partition_delivery.xml or partition.zip does not exist ...\n");
+			ret = 1;
+			goto getoutofflashing;
+		}
+	}
 
 	if ((dir = opendir(tmp)) != NULL)
 	{
 		printf("Repartitioning...\n");
 
 		/* search for partition_delivery.xml */
-#ifdef _WIN32
-		snprintf(sinfil, sizeof(sinfil), "%s\\partition\\partition_delivery.xml", working_path);
-#else
-		snprintf(sinfil, sizeof(sinfil), "./partition/partition_delivery.xml");
-#endif
 
 		if (stat(sinfil, &filestat) < 0)
 		{
@@ -4771,7 +5087,11 @@ skip_this:
 		if (stat(bootzip, &filestat) == 0)
 		{
 			printf("Found boot.zip, extracting ... \n");
-			system("unzip boot.zip -d boot");
+			if (unzip_file(bootzip, "boot") != 0) {
+				printf("Failed to extract boot.zip!\n");
+				ret = 1;
+				goto getoutofflashing;
+			}
 		} else {
 			printf("boot/boot_delivery.xml or boot.zip does not exist ...\n");
 			ret = 1;
@@ -5389,53 +5709,58 @@ endflashing:
 #endif
 	}
 
-	if (argc < 2)
-	{
 #if 1
-		switch(reboot_mode)
-		{
-			case 1:
-				snprintf(reboot_string, sizeof(reboot_string), "continue");
-				break;
+	switch(reboot_mode)
+	{
+		case 1:
+			snprintf(reboot_string, sizeof(reboot_string), "reboot");
+			break;
 
-			case 2:
-				snprintf(reboot_string, sizeof(reboot_string), "reboot-bootloader");
-				break;
+		case 2:
+			snprintf(reboot_string, sizeof(reboot_string), "continue");
+			break;
 
-			case 3:
-				snprintf(reboot_string, sizeof(reboot_string), "reboot");
-				break;
+		case 3:
+			snprintf(reboot_string, sizeof(reboot_string), "reboot-bootloader");
+			break;
 
-			case 0:
-			default:
-				snprintf(reboot_string, sizeof(reboot_string), "powerdown");
-				break;
-		}
+		case 4:
+			snprintf(reboot_string, sizeof(reboot_string), "reboot-fastboot");
+			break;
 
-		if (transfer_bulk_async(dev, EP_OUT, reboot_string, strlen(reboot_string), USB_TIMEOUT, 1) < 1)
-		{
-			printf(" - Error writing command %s!\n", reboot_string);
-			ret = 1;
-			goto release;
-		}
-		printf("Sent command: %s.\n", reboot_string);
+		case 5:
+			snprintf(reboot_string, sizeof(reboot_string), "reboot-recovery");
+			break;
 
-		if (!get_reply(dev, EP_IN, tmp, sizeof(tmp), USB_TIMEOUT, 0))
-		{
-			printf("Error, no %s response!\n", reboot_string);
-			ret = 1;
-			goto release;
-		}
+		case 0:
+		default:
+			snprintf(reboot_string, sizeof(reboot_string), "powerdown");
+			break;
+	}
+
+	if (transfer_bulk_async(dev, EP_OUT, reboot_string, strlen(reboot_string), USB_TIMEOUT, 1) < 1)
+	{
+		printf(" - Error writing command %s!\n", reboot_string);
+		ret = 1;
+		goto release;
+	}
+	printf("Sent command: %s.\n", reboot_string);
+
+	if (!get_reply(dev, EP_IN, tmp, sizeof(tmp), USB_TIMEOUT, 0))
+	{
+		printf("Error, no %s response!\n", reboot_string);
+		ret = 1;
+		goto release;
+	}
 #endif
-		if (reboot_mode == 0)
-		{
-			printf("\nEnd. You can disconnect your device when you close %s\n", progname);
-		}
-		else
-		{
-			//display_buffer_hex_ascii("reboot mode response", tmp_reply, get_reply_len);
-			printf("\nDone.\n");
-		}
+	if (reboot_mode == 0)
+	{
+		printf("\nEnd. You can disconnect your device when you close %s\n", progname);
+	}
+	else
+	{
+		//display_buffer_hex_ascii("reboot mode response", tmp_reply, get_reply_len);
+		printf("\nDone.\n");
 	}
 
 release:
@@ -5468,8 +5793,10 @@ memset(tmp_reply, 0, BUFF_MAX);
 if (flash_session_created)
 	rmdir("flash_session");
 
+#if 0
 #ifdef _WIN32
 	system("pause");
+#endif
 #endif
 	return ret;
 }
